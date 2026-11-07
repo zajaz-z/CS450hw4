@@ -209,19 +209,19 @@ def _iterative_lookup(target_name: dns.name.Name, qtype: int,
                 continue
 
             _append_answers(result, response)
-            if _answer_has_type(response, current_name, qtype):
-                return result
-
             cname = _cname_target(response, current_name)
             if cname is not None:
-                # CNAME is itself the requested result; for all other record
-                # types restart at the root/cached closest delegation.
-                if qtype == dns.rdatatype.CNAME:
-                    return result
+                # A recursive resolver returns the *entire* alias chain even
+                # when the requested type is CNAME.  Keep restarting until an
+                # authoritative server returns NODATA (or the requested
+                # non-CNAME record) so collect_results can print each link.
                 current_name = cname
                 cname_hops += 1
                 cname_restart = True
                 break
+
+            if _answer_has_type(response, current_name, qtype):
+                return result
 
             delegation = _referral(response)
             if delegation is None:
@@ -280,7 +280,9 @@ def collect_results(name: str) -> dict:
             for answer in answers:
                 if answers.rdtype == dns.rdatatype.CNAME:
                     full_response["CNAME"].append({"name": answer, "alias": alias})
-                    alias = str(answer)
+                    # Preserve dnspython's normal DNS-name formatting, as the
+                    # starter implementation did, for aliases after the first.
+                    alias = answer
 
         for rtype, label in ((dns.rdatatype.A, "A"),
                              (dns.rdatatype.AAAA, "AAAA"),
