@@ -12,9 +12,9 @@ import dns.message
 import dns.name
 import dns.query
 import dns.rdata
+import dns.rdataclass
 import dns.rdatatype
 import dns.rcode
-import dns.rdataclass
 
 
 FORMATS = (("CNAME", "{alias} is an alias for {name}"),
@@ -53,7 +53,11 @@ def _key(name: dns.name.Name, qtype: int) -> Tuple[str, int]:
 def _query(server: str, name: dns.name.Name, qtype: int) -> Optional[dns.message.Message]:
     """Send exactly one non-recursive IPv4 query, treating every error as a miss."""
     try:
-        query = dns.message.make_query(name, qtype, use_edns=False)
+        # Root and TLD delegations (notably .com and .edu) often contain
+        # enough NS and glue records to exceed the old 512-byte UDP limit.
+        # EDNS avoids a truncated referral and the many needless recursive
+        # NS-host lookups that a partial Additional section would cause.
+        query = dns.message.make_query(name, qtype, use_edns=0, payload=1232)
         query.flags &= ~dns.flags.RD
         return dns.query.udp(query, server, timeout=TIMEOUT)
     except Exception:
@@ -100,8 +104,8 @@ def _cname_target(response: dns.message.Message,
     return None
 
 
-def _referral(response: dns.message.Message) -> Optional[Tuple[dns.name.Name, List[dns.name.Name], List[str]]]:
-    """Return (delegated zone, NS names, IPv4 glue) for an NS referral."""
+def _referral(response: dns.message.Message) -> Optional[Tuple[dns.name.Name, List[dns.name.Name], Dict[dns.name.Name, List[str]]]]:
+    """Return (delegated zone, NS names, IPv4 glue indexed by NS name)."""
     nameservers: List[dns.name.Name] = []
     zone = None
     for rrset in _rrsets(response, response.authority):
@@ -112,10 +116,10 @@ def _referral(response: dns.message.Message) -> Optional[Tuple[dns.name.Name, Li
         return None
 
     wanted = {server.canonicalize() for server in nameservers}
-    glue: List[str] = []
+    glue: Dict[dns.name.Name, List[str]] = {}
     for rrset in _rrsets(response, response.additional):
         if rrset.rdtype == dns.rdatatype.A and rrset.name.canonicalize() in wanted:
-            glue.extend(str(record) for record in rrset)
+            glue[rrset.name.canonicalize()] = [str(record) for record in rrset]
     return zone, nameservers, glue
 
 
@@ -141,8 +145,12 @@ def _resolve_nameserver_addresses(nameservers: Sequence[dns.name.Name],
         # recursing forever.  Other nameservers in the referral may still work.
         if ns_key in resolving:
             continue
-        response = _iterative_lookup(nameserver, dns.rdatatype.A,
-                                     resolving | {ns_key})
+        cache_key = _key(nameserver, dns.rdatatype.A)
+        response = ANSWER_CACHE.get(cache_key)
+        if response is None:
+            response = _iterative_lookup(nameserver, dns.rdatatype.A,
+                                         resolving | {ns_key})
+            ANSWER_CACHE[cache_key] = response
         for rrset in _rrsets(response, response.answer):
             if rrset.rdtype == dns.rdatatype.A:
                 addresses.extend(str(record) for record in rrset)
@@ -166,11 +174,27 @@ def _iterative_lookup(target_name: dns.name.Name, qtype: int,
     while cname_hops <= MAX_CNAME_RESTARTS:
         servers = list(_best_cached_servers(current_name))
         visited_servers: Set[str] = set()
+        pending_nameservers: List[dns.name.Name] = []
+        delegation_zone: Optional[str] = None
         cname_restart = False
 
-        # At each delegation, try every supplied IPv4 address.  A failed
-        # address is never retried for this query.
-        while servers:
+        # At each delegation, try every supplied IPv4 address.  For an
+        # unglued referral, resolve NS hostnames lazily: there is no reason to
+        # resolve (and wait for) every NS hostname when the first one can
+        # immediately answer the original question.
+        while servers or pending_nameservers:
+            if not servers:
+                nameserver = pending_nameservers.pop(0)
+                discovered = _resolve_nameserver_addresses([nameserver], resolving)
+                for address in discovered:
+                    if address not in visited_servers and address not in servers:
+                        servers.append(address)
+                if delegation_zone is not None and discovered:
+                    old = DELEGATION_CACHE.get(delegation_zone, ())
+                    DELEGATION_CACHE[delegation_zone] = tuple(dict.fromkeys(
+                        list(old) + discovered))
+                continue
+
             server = servers.pop(0)
             if server in visited_servers:
                 continue
@@ -205,16 +229,19 @@ def _iterative_lookup(target_name: dns.name.Name, qtype: int,
                 return result
 
             zone, ns_names, glue = delegation
-            next_servers = list(dict.fromkeys(glue))
-            if len(next_servers) < len(ns_names):
-                next_servers.extend(ip for ip in _resolve_nameserver_addresses(ns_names, resolving)
-                                    if ip not in next_servers)
-            if not next_servers:
-                continue
-
-            # Cache the delegation even when all glue was absent ("unglued"
-            # nameservers); only IPv4 endpoints are kept.
-            DELEGATION_CACHE[zone.canonicalize().to_text().lower()] = tuple(next_servers)
+            next_servers = list(dict.fromkeys(
+                address for addresses in glue.values() for address in addresses))
+            # Do not resolve every NS host just because a referral happened to
+            # addresses than NS names.  Only hosts without A glue are queued
+            # for a recursive sub-lookup, and only if the glued addresses do
+            # not produce an answer.
+            pending_nameservers = [ns for ns in ns_names
+                                   if ns.canonicalize() not in glue]
+            delegation_zone = zone.canonicalize().to_text().lower()
+            # Cache any glue immediately.  Discovered unglued addresses are
+            # appended as they are needed above.
+            if next_servers:
+                DELEGATION_CACHE[delegation_zone] = tuple(next_servers)
             servers = next_servers
 
         # Referrals continue in the inner loop.  Re-enter this loop only when
